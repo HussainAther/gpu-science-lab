@@ -53,6 +53,7 @@ static GLuint makeProgram(const char* vs, const char* fs) {
 GLView::GLView(QWidget* parent) : QOpenGLWidget(parent) {
   connect(&m_tick, &QTimer::timeout, this, QOverload<>::of(&GLView::update));
   m_tick.start(16);
+  setMouseTracking(true);
 }
 
 GLView::~GLView() {

@@ -17,6 +17,38 @@ __device__ __forceinline__ int wrap(int x, int n) {
   return (x < 0) ? (x + n) : (x >= n ? (x - n) : x);
 }
 
+__global__ void injectKernel(
+  float* U, float* V,
+  int w, int h,
+  int cx, int cy,
+  int radius,
+  float addV,
+  float subU
+) {
+  int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+  if (x >= w || y >= h) return;
+
+  int dx = x - cx;
+  int dy = y - cy;
+  int r2 = radius * radius;
+  int d2 = dx*dx + dy*dy;
+  if (d2 > r2) return;
+
+  // Soft brush falloff
+  float t = 1.0f - (float)d2 / (float)r2;     // 1 at center, 0 at edge
+  float strength = t * t;                      // smoother falloff
+
+  int i = y * w + x;
+
+  // Inject: add V, optionally subtract U
+  float v = V[i] + addV * strength;
+  float u = U[i] - subU * strength;
+
+  V[i] = fminf(fmaxf(v, 0.0f), 1.0f);
+  U[i] = fminf(fmaxf(u, 0.0f), 1.0f);
+}
+
 __global__ void seedKernel(float* U, float* V, int w, int h) {
   int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
@@ -120,6 +152,85 @@ void SimulationCuda::reset() {
   m_flip = false;
 }
 
+void SimulationCuda::inject(int x, int y, int radius, float addV, float subU) {
+  if (m_w <= 0 || m_h <= 0) return;
+
+  // Clamp center to bounds
+  if (x < 0) x = 0; if (x >= m_w) x = m_w - 1;
+  if (y < 0) y = 0; if (y >= m_h) y = m_h - 1;
+
+  // Ensure sane radius
+  if (radius < 1) radius = 1;
+  if (radius > 512) radius = 512;
+
+  // IMPORTANT: inject into the "current" buffers (the ones used as U0/V0 for the next step)
+  float* Ucur = m_flip ? d_U1 : d_U0;
+  float* Vcur = m_flip ? d_V1 : d_V0;
+
+  // Launch only around the brush region for speed
+  int x0 = x - radius, x1 = x + radius;
+  int y0 = y - radius, y1 = y + radius;
+  if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+  if (x1 >= m_w) x1 = m_w - 1;
+  if (y1 >= m_h) y1 = m_h - 1;
+
+  int regionW = (x1 - x0 + 1);
+  int regionH = (y1 - y0 + 1);
+
+  dim3 bs(16, 16);
+  dim3 gs((regionW + bs.x - 1) / bs.x, (regionH + bs.y - 1) / bs.y);
+
+  // Offset kernel coords by (x0,y0) by shifting the launch pointer
+  // Easiest: launch full grid but adjust cx/cy; we launch over region and compute absolute coords:
+  // We'll do that by adding x0/y0 inside kernel via pointer math—BUT simpler is:
+  // Launch over full grid = too expensive.
+  // So: launch over region and treat (thread coords + x0/y0) as absolute.
+  // That requires a tiny kernel wrapper; easiest patch: just inject over region but compute absolute coords:
+
+  // We'll reuse injectKernel by launching over region and using shifted center:
+  // Absolute x = x0 + local_x, absolute y = y0 + local_y
+  // We implement that with a small lambda kernel? Not possible easily.
+  // Instead: do region launch by calling a second kernel that adds offsets:
+
+  // --- Region kernel:
+  auto regionKernel = [] __global__ (
+    float* U, float* V,
+    int w, int h,
+    int x0, int y0,
+    int cx, int cy,
+    int radius,
+    float addV, float subU
+  ) {
+    int lx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int ly = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+
+    int ax = x0 + lx;
+    int ay = y0 + ly;
+    if (ax >= w || ay >= h) return;
+
+    int dx = ax - cx;
+    int dy = ay - cy;
+    int r2 = radius * radius;
+    int d2 = dx*dx + dy*dy;
+    if (d2 > r2) return;
+
+    float t = 1.0f - (float)d2 / (float)r2;
+    float strength = t * t;
+
+    int i = ay * w + ax;
+    float v = V[i] + addV * strength;
+    float u = U[i] - subU * strength;
+
+    V[i] = fminf(fmaxf(v, 0.0f), 1.0f);
+    U[i] = fminf(fmaxf(u, 0.0f), 1.0f);
+  };
+
+  // Launch regionKernel
+  regionKernel<<<gs, bs>>>(Ucur, Vcur, m_w, m_h, x0, y0, x, y, radius, addV, subU);
+  ck(cudaGetLastError(), "regionKernel launch");
+}
+
+
 void SimulationCuda::setPreset(int idx) {
   if (idx == 0) { m_p.F = 0.035f; m_p.k = 0.065f; }
   if (idx == 1) { m_p.F = 0.030f; m_p.k = 0.055f; }
@@ -163,4 +274,3 @@ void SimulationCuda::stepAndRenderToPBO() {
 
   m_flip = !m_flip;
 }
-
