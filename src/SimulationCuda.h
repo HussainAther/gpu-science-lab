@@ -14,6 +14,9 @@ public:
   void init(int w, int h, const SimulationParams& p);
   void shutdown();
 
+  // Mouse painting: inject V / optionally remove U
+  void inject(int x, int y, int radius, float addV, float subU);
+
   void reset();
   void setPreset(int idx);
 
